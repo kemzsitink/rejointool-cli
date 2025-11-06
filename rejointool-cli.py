@@ -1,3 +1,4 @@
+
 import os
 import uuid
 import requests
@@ -41,6 +42,7 @@ webhook_thread = None
 
 # Biến cho tính năng Auto Rejoin
 status_lock = Lock()
+rejoin_lock = Lock()
 package_statuses = {}
 username_cache = {}
 stop_event = threading.Event()
@@ -65,31 +67,6 @@ lua_script_template = '-- # Developed By Gemini\nloadstring(game:HttpGet("https:
 # Cấu hình Logger
 logger.remove()
 logger.add(sink=sys.stdout, format='{time:YYYY-MM-DD HH:mm:ss} | {level} | {message}', level='INFO')
-
-# Khởi tạo ThreadPoolExecutor cho các tác vụ I/O chặn
-# Số worker = số luồng giám sát + 1 (cho webhook) + 1 (dự phòng)
-MAX_WORKERS = max(threading.active_count(), 10) 
-executor_pool = ThreadPoolExecutor(max_workers=MAX_WORKERS)
-
-# --- Hàm tiện ích cho Shell/ADB (Chạy trong Executor) ---
-
-def run_shell_command_blocking(command_list, check=False):
-    """Chạy lệnh shell đồng bộ trong một luồng riêng."""
-    try:
-        # Nếu command_list là string (ví dụ: cho os.system), dùng shell=True
-        if isinstance(command_list, str):
-            result = subprocess.run(command_list, shell=True, capture_output=True, text=True, check=check)
-        else:
-            # Nếu command_list là list, dùng shell=False
-            result = subprocess.run(command_list, capture_output=True, text=True, check=check)
-            
-        return result
-    except subprocess.CalledProcessError as e:
-        logger.error(f"Command failed: {command_list}. Stderr: {e.stderr}")
-        return e
-    except Exception as e:
-        logger.error(f"Error executing command {command_list}: {e}")
-        return None
 
 # --- Các hàm Tiện ích & Giao diện (UI) ---
 
@@ -148,47 +125,30 @@ def create_dynamic_menu(options):
         table.add_row([f'{i}.', option])
     print(Fore.LIGHTCYAN_EX + str(table))
 
-def update_status_table_blocking(package_statuses):
-    """Cập nhật và hiển thị bảng trạng thái cho tính năng auto-rejoin (Blocking I/O)."""
+def update_status_table(package_statuses):
+    """Cập nhật và hiển thị bảng trạng thái cho tính năng auto-rejoin."""
     clear_console()
     print_header()
     table = PrettyTable()
     table.field_names = ['Package', 'Username', 'Status']
     table.align = 'l'
     table.border = True
-    
-    current_statuses = {}
     with status_lock:
-        current_statuses.update(package_statuses)
-        
-    for package, info in current_statuses.items():
-        table.add_row([package, info.get('Username', 'Unknown'), info.get('Status', '')])
+        for package, info in package_statuses.items():
+            table.add_row([package, info.get('Username', 'Unknown'), info.get('Status', '')])
     print(str(table))
 
-def status_update_thread_func():
-    """Luồng chạy nền để cập nhật bảng trạng thái định kỳ."""
-    while not stop_event.is_set():
-        # Chỉ cập nhật nếu có trạng thái cần hiển thị
-        if package_statuses:
-            update_status_table_blocking(package_statuses)
-        time.sleep(1) # Cập nhật mỗi giây
-
 def get_roblox_packages():
-    """Lấy danh sách các gói (package) Roblox đã cài đặt trên thiết bị (Chạy trong Executor)."""
+    """Lấy danh sách các gói (package) Roblox đã cài đặt trên thiết bị."""
     packages = []
-    
-    # Sử dụng subprocess để đảm bảo lệnh được chạy trong luồng pool
-    output = executor_pool.submit(run_shell_command_blocking, 'pm list packages').result()
-    
-    if isinstance(output, subprocess.CalledProcessError):
+    try:
+        output = subprocess.check_output('pm list packages', shell=True, text=True)
+    except subprocess.CalledProcessError:
         print(Fore.RED + 'An error occurred while searching for packages on your device!' + Style.RESET_ALL)
-        return packages
-    
-    if output is None:
         return packages
 
     print(Fore.YELLOW + 'Checking Packages On Your Device .....' + Style.RESET_ALL)
-    for line in output.stdout.splitlines():
+    for line in output.splitlines():
         if 'com.roblox.' in line:
             package_name = line.split(':')[1]
             print(Fore.GREEN + f'Package Found : {package_name}' + Style.RESET_ALL)
@@ -200,60 +160,54 @@ def get_roblox_packages():
     return packages
 
 def delete_roblox_cache():
-    """Xóa bộ nhớ đệm (cache) của tất cả các ứng dụng Roblox (Chạy trong Executor)."""
+    """Xóa bộ nhớ đệm (cache) của tất cả các ứng dụng Roblox."""
     base_path = '/data/data'
     deleted_count = 0
-    
-    try:
-        # Giả sử chúng ta có thể liệt kê thư mục /data/data (cần root)
-        folders = os.listdir(base_path) 
-    except FileNotFoundError:
-        print(Fore.RED + 'Cannot access /data/data. Do you have root permission?' + Style.RESET_ALL)
-        input(Fore.CYAN + "Press Enter to return to main menu..." + Style.RESET_ALL)
-        return
-    except Exception as e:
-        print(Fore.RED + f'Error listing folders: {e}' + Style.RESET_ALL)
-        input(Fore.CYAN + "Press Enter to return to main menu..." + Style.RESET_ALL)
-        return
-
-    print(Fore.YELLOW + 'Starting cache deletion (using "rm -rf")...' + Style.RESET_ALL)
-    
-    delete_tasks = []
-    for folder in folders:
+    for folder in os.listdir(base_path):
         if folder.startswith('com.roblox.'):
             cache_path = os.path.join(base_path, folder, 'cache')
-            # Sử dụng lệnh shell rm -rf để đảm bảo xóa nhanh chóng và an toàn (với quyền root)
-            delete_tasks.append(executor_pool.submit(run_shell_command_blocking, f'rm -rf {cache_path}'))
-            deleted_count += 1
-            print(Fore.YELLOW + f'Scheduled deletion for {folder} cache.' + Style.RESET_ALL)
-
-    # Chờ tất cả tác vụ hoàn thành
-    for task in delete_tasks:
-        task.result() 
-
+            if os.path.exists(cache_path):
+                try:
+                    shutil.rmtree(cache_path)
+                    print(Fore.GREEN + f'Deleted cache for {folder}' + Style.RESET_ALL)
+                    deleted_count += 1
+                except Exception as e:
+                    print(Fore.RED + f'Failed to delete cache for {folder}: {e}' + Style.RESET_ALL)
+    
     if deleted_count == 0:
         print(Fore.YELLOW + 'No Roblox cache found to delete.' + Style.RESET_ALL)
-    else:
-        print(Fore.GREEN + f'Cache deletion scheduled/completed for {deleted_count} packages.' + Style.RESET_ALL)
     
     input(Fore.CYAN + "Press Enter to return to main menu..." + Style.RESET_ALL)
 
 # --- Tính năng 1: Webhook ---
 
 def capture_screenshot():
-    """Chụp ảnh màn hình và lưu vào /storage/emulated/0/Download/ (Chạy trong Executor)."""
+    """Chụp ảnh màn hình và lưu vào /storage/emulated/0/Download/."""
     screenshot_path = '/storage/emulated/0/Download/screenshot.png'
     command = f'/system/bin/screencap -p {screenshot_path}'
     
-    # Chạy lệnh blocking trong Executor
-    result = executor_pool.submit(run_shell_command_blocking, command).result()
+    try:
+        # On Android, if we are already root (e.g. running via tsu), we don't need 'su -c'.
+        is_root = hasattr(os, 'geteuid') and os.geteuid() == 0
+    except AttributeError:
+        is_root = False
+
+    full_command = command if is_root else f'su -c "{command}"'
     
-    if result is not None and result.returncode == 0 and os.path.exists(screenshot_path):
-        print(Fore.GREEN + f'[ VCP Manager ] - Screenshot saved to: {screenshot_path}' + Style.RESET_ALL)
-        return screenshot_path
-    else:
-        error_message = (result.stderr.strip() if result and result.stderr else "Unknown error.")
-        logger.error(f'[ VCP Manager ] - Error capturing screenshot. Error: {error_message}')
+    try:
+        # Use subprocess.run to capture output and errors
+        result = subprocess.run(full_command, shell=True, capture_output=True, text=True, check=False)
+        
+        if result.returncode == 0 and os.path.exists(screenshot_path):
+            print(Fore.GREEN + f'[ VCP Manager ] - Screenshot saved to: {screenshot_path}' + Style.RESET_ALL)
+            return screenshot_path
+        else:
+            # Show the error message from stderr if available
+            error_message = result.stderr.strip() if result.stderr else "Unknown error."
+            raise Exception(f"Lệnh chụp ảnh màn hình thất bại. Mã thoát: {result.returncode}. Lỗi: {error_message}")
+
+    except Exception as e:
+        print(Fore.RED + f'[ VCP Manager ] - Error capturing screenshot: {e}' + Style.RESET_ALL)
         return None
 
 def get_system_info():
@@ -274,17 +228,11 @@ def load_webhook_config():
     """Tải cấu hình webhook từ tệp config-wh.json."""
     global webhook_url, device_name, interval
     if os.path.exists(CONFIG_WH_FILE):
-        try:
-            with open(CONFIG_WH_FILE, 'r') as file:
-                config = json.load(file)
-                webhook_url = config.get('webhook_url')
-                device_name = config.get('device_name')
-                interval = config.get('interval')
-        except (IOError, json.JSONDecodeError) as e:
-            logger.error(f"Error loading webhook config: {e}. Resetting config.")
-            webhook_url = None
-            device_name = None
-            interval = None
+        with open(CONFIG_WH_FILE, 'r') as file:
+            config = json.load(file)
+            webhook_url = config.get('webhook_url')
+            device_name = config.get('device_name')
+            interval = config.get('interval')
     else:
         webhook_url = None
         device_name = None
@@ -293,12 +241,8 @@ def load_webhook_config():
 def save_webhook_config():
     """Lưu cấu hình webhook vào tệp config-wh.json."""
     config = {'webhook_url': webhook_url, 'device_name': device_name, 'interval': interval}
-    try:
-        with open(CONFIG_WH_FILE, 'w') as file:
-            json.dump(config, file, indent=4)
-    except IOError as e:
-        logger.error(f"Error saving webhook config: {e}")
-
+    with open(CONFIG_WH_FILE, 'w') as file:
+        json.dump(config, file, indent=4)
 
 def send_webhook():
     """Vòng lặp gửi thông tin thiết bị và ảnh chụp màn hình tới webhook."""
@@ -308,11 +252,9 @@ def send_webhook():
             print(Fore.RED + '[ VCP Manager ] - Webhook config is missing. Stopping thread.' + Style.RESET_ALL)
             break
             
-        # Tác vụ chặn: Chụp màn hình
-        screenshot_path = capture_screenshot() 
-        
+        screenshot_path = capture_screenshot()
         if screenshot_path is None or not os.path.exists(screenshot_path):
-            print(Fore.RED + '[ VCP Manager ] - Screenshot file does not exist or capture failed. Skipping webhook.' + Style.RESET_ALL)
+            print(Fore.RED + '[ VCP Manager ] - Screenshot file does not exist. Skipping webhook.' + Style.RESET_ALL)
             time.sleep(interval * 60)
             continue
 
@@ -330,16 +272,11 @@ def send_webhook():
         }
         payload = {'embeds': [embed], 'username': device_name}
 
-        # Tác vụ chặn: Gửi request
         try:
             with open(screenshot_path, 'rb') as file:
-                # Sử dụng requests đồng bộ, chấp nhận việc luồng này bị chặn khi gửi
-                response = requests.post(webhook_url, 
-                                         data={'payload_json': json.dumps(payload)}, 
-                                         files={'file': ('screenshot.png', file)},
-                                         timeout=30)
+                response = requests.post(webhook_url, data={'payload_json': json.dumps(payload)}, files={'file': ('screenshot.png', file)})
             
-            if response.status_code in [204, 200]:
+            if response.status_code == 204 or response.status_code == 200:
                 print(Fore.GREEN + '[ VCP Manager ] - Device information has been successfully sent to the webhook.' + Style.RESET_ALL)
             else:
                 print(Fore.RED + f'[ VCP Manager ] - Error sending device information to the webhook, status code: {response.status_code}' + Style.RESET_ALL)
@@ -361,9 +298,6 @@ def stop_webhook():
     """Dừng luồng gửi webhook."""
     global stop_webhook_thread
     stop_webhook_thread = True
-    if webhook_thread and webhook_thread.is_alive():
-        # Không cần join vì nó sẽ dừng ở time.sleep tiếp theo
-        pass
     print(Fore.YELLOW + '[ VCP Manager ] - Webhook thread stopped.' + Style.RESET_ALL)
 
 def setup_webhook():
@@ -401,7 +335,6 @@ def setup_webhook():
 def verify_cookie(cookie_value):
     """Kiểm tra xem cookie .ROBLOSECURITY có hợp lệ hay không."""
     try:
-        # Sử dụng requests đồng bộ, chấp nhận việc này chặn luồng gọi nó.
         headers = {
             'Cookie': f'.ROBLOSECURITY={cookie_value}',
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36'
@@ -423,28 +356,26 @@ def verify_cookie(cookie_value):
 
 def download_file(url, destination, binary=False):
     """Tải tệp từ URL về máy."""
-    # Tác vụ chặn: download
     try:
         response = requests.get(url, stream=True)
-        response.raise_for_status()
-        
-        mode = 'wb' if binary else 'w'
-        with open(destination, mode) as file:
-            if binary:
-                shutil.copyfileobj(response.raw, file)
-            else:
-                file.write(response.text)
-        print(Fore.GREEN + f'[ VCP Manager ] -> {os.path.basename(destination)} downloaded successfully.' + Style.RESET_ALL)
-        return destination
-    except requests.RequestException as e:
-        print(Fore.RED + f'[ VCP Manager ] -> Failed to download {os.path.basename(destination)}: {e}' + Style.RESET_ALL)
-        return None
+        if response.status_code == 200:
+            mode = 'wb' if binary else 'w'
+            with open(destination, mode) as file:
+                if binary:
+                    shutil.copyfileobj(response.raw, file)
+                else:
+                    file.write(response.text)
+            print(Fore.GREEN + f'[ VCP Manager ] -> {os.path.basename(destination)} downloaded successfully.' + Style.RESET_ALL)
+            return destination
+        else:
+            print(Fore.RED + f'[ VCP Manager ] -> Failed to download {os.path.basename(destination)}.' + Style.RESET_ALL)
+            return None
     except Exception as e:
         print(Fore.RED + f'[ VCP Manager ] -> Error downloading {os.path.basename(destination)}: {e}' + Style.RESET_ALL)
         return None
 
 def replace_cookie_value_in_db(db_path, new_cookie_value):
-    """Thay thế giá trị cookie .ROBLOSECURITY trong tệp CSDL SQLite (Tác vụ chặn)."""
+    """Thay thế giá trị cookie .ROBLOSECURITY trong tệp CSDL SQLite."""
     try:
         conn = sqlite3.connect(db_path)
         cursor = conn.cursor()
@@ -481,14 +412,13 @@ def replace_cookie_value_in_db(db_path, new_cookie_value):
         print(Fore.RED + f'[ VCP Manager ] -> Error replacing cookie value in database: {e}' + Style.RESET_ALL)
 
 def inject_cookies_and_appstorage():
-    """Tiêm cookie và appStorage vào tất cả các gói Roblox (Tác vụ chặn)."""
+    """Tiêm cookie và appStorage vào tất cả các gói Roblox."""
     print_header()
     print(Fore.CYAN + "--- Inject Cookies and AppStorage ---" + Style.RESET_ALL)
     
     db_url = 'https://raw.githubusercontent.com/kemzsitink/rejointool-cli/refs/heads/main/Cookies'
     appstorage_url = 'https://raw.githubusercontent.com/kemzsitink/rejointool-cli/refs/heads/main/appStorage.json'
     
-    # Download file (Blocking I/O)
     downloaded_db_path = download_file(db_url, 'Cookies.db', binary=True)
     downloaded_appstorage_path = download_file(appstorage_url, 'appStorage.json', binary=False)
     
@@ -514,7 +444,7 @@ def inject_cookies_and_appstorage():
         input(Fore.CYAN + "Press Enter to return to main menu..." + Style.RESET_ALL)
         return
 
-    packages = get_roblox_packages() # Blocking call, nhưng đã được tối ưu hóa trong phần khác
+    packages = get_roblox_packages()
     if not packages:
         input(Fore.CYAN + "Press Enter to return to main menu..." + Style.RESET_ALL)
         return
@@ -544,7 +474,6 @@ def inject_cookies_and_appstorage():
                 
             print(Fore.GREEN + f'[ VCP Manager ] -> Injecting cookie for {package_name}...' + Style.RESET_ALL)
             
-            # --- Thao tác file trên Android (Cần quyền root) ---
             destination_db_dir = f'/data/data/{package_name}/app_webview/Default/'
             destination_appstorage_dir = f'/data/data/{package_name}/files/appData/LocalStorage/'
             
@@ -572,14 +501,12 @@ def find_other_roblox_data_paths():
     base_path = '/data/data'
     paths = []
     try:
-        # Cần quyền root để liệt kê thư mục này
         for folder in os.listdir(base_path):
             if folder.lower().startswith('com.roblox.'):
                 potential_path = os.path.join(base_path, folder)
                 if os.path.isdir(potential_path):
                     paths.append(potential_path)
     except FileNotFoundError:
-        print(Fore.RED + 'Cannot access /data/data. Do you have root permission?' + Style.RESET_ALL)
         pass
     return paths
 
@@ -705,24 +632,32 @@ def getcookie_process():
 # --- Tính năng 3: Auto Rejoin ---
 
 def detect_and_write_lua_script():
-    """Phát hiện các executor và ghi tệp LUA vào thư mục Autoexec (Tác vụ chặn)."""
+    """Phát hiện các executor và ghi tệp LUA vào thư mục Autoexec."""
     detected_executors = []
     for executor_name, base_path in executors.items():
+        # Chỉ tiếp tục nếu thư mục CƠ SỞ của executor tồn tại
         if not os.path.exists(base_path) or not os.path.isdir(base_path):
             continue
 
+        # --- SỬA LỖI ---
+        # Tự động tạo thư mục 'Autoexec' nếu nó không tồn tại
+        # Đây là cách tiếp cận 'chủ động' thay vì 'bị động'
         autoexec_path = os.path.join(base_path, 'Autoexec')
         lua_written = False
         
         try:
+            # Tạo thư mục Autoexec (và các thư mục cha) nếu chưa có
             os.makedirs(autoexec_path, exist_ok=True)
+            
+            # Ghi tệp LUA vào đó
             lua_script_path = os.path.join(autoexec_path, 'executor_check.lua')
             with open(lua_script_path, 'w') as file:
                 file.write(lua_script_template)
             lua_written = True
             
         except Exception as e:
-            logger.error(f'Failed to create/write to {autoexec_path}: {e}')
+            print(Fore.RED + f'Failed to create/write to {autoexec_path}: {e}' + Style.RESET_ALL)
+        # --- KẾT THÚC SỬA LỖI ---
         
         if lua_written:
             detected_executors.append(executor_name)
@@ -730,20 +665,22 @@ def detect_and_write_lua_script():
     return detected_executors
 
 def reset_executor_file(username):
-    """Xóa tệp trạng thái executor_check_USERNAME.txt (Tác vụ chặn)."""
+    """Xóa tệp trạng thái executor_check_USERNAME.txt."""
     status_file = f'executor_check_{username}.txt'
     for workspace_path in workspace_paths:
         if os.path.exists(workspace_path):
             file_path = os.path.join(workspace_path, status_file)
             if os.path.exists(file_path):
                 try:
-                    # Sử dụng lệnh shell rm để xóa
-                    executor_pool.submit(run_shell_command_blocking, f'rm {file_path}').result()
+                    os.remove(file_path)
                 except Exception:
                     pass
 
 def check_executor_status(username, max_inactivity_time=30):
-    """Kiểm tra trạng thái executor (Tác vụ chặn)."""
+    """
+    Kiểm tra tệp trạng thái do script LUA tạo ra.
+    Trạng thái được coi là 'hoạt động' nếu tệp tồn tại và được cập nhật gần đây.
+    """
     status_file = f'executor_check_{username}.txt'
     active_workspace_found = False
     
@@ -759,54 +696,86 @@ def check_executor_status(username, max_inactivity_time=30):
                 last_modified_time = os.path.getmtime(file_path)
                 current_time = time.time()
                 
+                # Nếu tệp được sửa đổi trong khoảng thời gian max_inactivity_time
                 if (current_time - last_modified_time) < max_inactivity_time:
                     return True # Executor đang hoạt động
             except Exception as e:
-                logger.error(f"Error checking file status {file_path}: {e}")
+                print(Fore.RED + f"Error checking file status {file_path}: {e}" + Style.RESET_ALL)
                 
+    if not active_workspace_found:
+        # Nếu không tìm thấy thư mục workspace, giả sử không có executor
+        # Đây là lỗi logic, lẽ ra phải trả về False để kích hoạt rejoin nếu 
+        # executor đã được phát hiện (monitor thread đã chạy)
+        return False # Sửa từ True thành False
+
+    return False # Executor không hoạt động (nếu tìm thấy workspace nhưng không thấy file)
+
+def is_roblox_running(package_name):
+    """Kiểm tra xem tiến trình Roblox có đang chạy hay không."""
+    for proc in psutil.process_iter(['name']):
+        if package_name in proc.info['name'].lower():
+            return True
     return False
 
 def kill_roblox_process(package_name):
-    """Dừng tiến trình Roblox bằng pkill (Chạy trong Executor)."""
-    logger.info(f'Killing Roblox process for {package_name}...')
-    # Sử dụng pkill -f để đảm bảo dừng đúng package
-    executor_pool.submit(run_shell_command_blocking, f'pkill -f {package_name}').result()
-    time.sleep(2) 
+    """Dừng tiến trình Roblox bằng pkill."""
+    print(f'Killing Roblox process for {package_name}...')
+    os.system(f'pkill -f {package_name}')
+    time.sleep(2) # Đợi tiến trình chết hẳn
 
 def format_server_link_if_needed(input_link):
-    """Đảm bảo link server ở đúng định dạng URI roblox://"""
+    """
+    Đảm bảo link server ở đúng định dạng URI roblox://
+    Nếu người dùng nhập chỉ ID (toàn số), nó sẽ thêm vào.
+    Nếu người dùng nhập link private (chứa robblox.com), nó giữ nguyên.
+    """
     if input_link.isdigit():
+        # Nếu chỉ là số (Place ID)
         return f'roblox://placeID={input_link}'
     elif 'roblox.com' in input_link:
+        # Nếu là link private server
         return input_link
     else:
+        # Trường hợp không rõ (hoặc đã có roblox://), cứ trả về
         return input_link
 
 def launch_roblox(package_name, server_link, num_packages, package_statuses):
-    """Khởi chạy Roblox và tham gia máy chủ (Chạy trong Executor)."""
+    """Khởi chạy Roblox và tham gia máy chủ."""
     
+    # --- SỬA LỖI ---
+    # Thêm dòng này để định dạng lại link trước khi dùng
     formatted_link = format_server_link_if_needed(server_link)
+    # --- KẾT THÚC SỬA LỖI ---
     
-    with status_lock:
-        package_statuses[package_name]['Status'] = Fore.LIGHTCYAN_EX + f'Opening Roblox for {package_name}...' + Style.RESET_ALL
-    
-    # Lệnh 1: Mở ứng dụng (Splash screen)
-    cmd1 = ['am', 'start', '-n', f'{package_name}/com.roblox.client.startup.ActivitySplash', '-d', formatted_link]
-    executor_pool.submit(run_shell_command_blocking, cmd1).result()
-    
-    time.sleep(15 if num_packages >= 6 else 8)
-    
-    with status_lock:
-        package_statuses[package_name]['Status'] = Fore.LIGHTCYAN_EX + f'Joining Roblox for {package_name}...' + Style.RESET_ALL
-    
-    # Lệnh 2: Gửi lệnh join
-    cmd2 = ['am', 'start', '-n', f'{package_name}/com.roblox.client.ActivityProtocolLaunch', '-d', formatted_link]
-    executor_pool.submit(run_shell_command_blocking, cmd2).result()
-    
-    time.sleep(20) # Đợi game tải
-    
-    with status_lock:
-        package_statuses[package_name]['Status'] = Fore.GREEN + 'Joined Roblox' + Style.RESET_ALL
+    try:
+        with status_lock:
+            package_statuses[package_name]['Status'] = Fore.LIGHTCYAN_EX + f'Opening Roblox for {package_name}...' + Style.RESET_ALL
+        update_status_table(package_statuses)
+        
+        # Mở ứng dụng
+        subprocess.run(['am', 'start', '-n', f'{package_name}/com.roblox.client.startup.ActivitySplash', '-d', formatted_link], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL) # Sửa thành formatted_link
+        
+        # Đợi một chút
+        time.sleep(15 if num_packages >= 6 else 8)
+        
+        with status_lock:
+            package_statuses[package_name]['Status'] = Fore.LIGHTCYAN_EX + f'Joining Roblox for {package_name}...' + Style.RESET_ALL
+        update_status_table(package_statuses)
+        
+        # Gửi lệnh join
+        subprocess.run(['am', 'start', '-n', f'{package_name}/com.roblox.client.ActivityProtocolLaunch', '-d', formatted_link], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL) # Sửa thành formatted_link
+        
+        time.sleep(20) # Đợi game tải
+        
+        with status_lock:
+            package_statuses[package_name]['Status'] = Fore.GREEN + 'Joined Roblox' + Style.RESET_ALL
+        update_status_table(package_statuses)
+        
+    except Exception as e:
+        with status_lock:
+            package_statuses[package_name]['Status'] = Fore.RED + f'Error launching Roblox for {package_name}: {e}' + Style.RESET_ALL
+        update_status_table(package_statuses)
+        print(f'Error details: {e}')
 
 def background_executor_monitor(package_name, username, package_statuses, server_link, num_packages, retry_limit=3):
     """
@@ -821,33 +790,33 @@ def background_executor_monitor(package_name, username, package_statuses, server
             if stop_event.is_set():
                 break
 
-            # Kiểm tra trạng thái executor (tác vụ chặn I/O)
-            if not executor_pool.submit(check_executor_status, username).result():
+            if not check_executor_status(username):
                 retry_count += 1
                 logger.warning(f"Executor failed for {username}. Rejoin attempt {retry_count}/{retry_limit}.")
                 
                 with status_lock:
                     package_statuses[package_name]['Status'] = Fore.RED + f'Executor failed, rejoining (Attempt {retry_count})...' + Style.RESET_ALL
+                update_status_table(package_statuses)
 
                 if retry_count >= retry_limit:
                     with status_lock:
                         package_statuses[package_name]['Status'] = Fore.RED + 'Reached retry limit, stopping rejoin attempts.' + Style.RESET_ALL
-                    break 
+                    update_status_table(package_statuses)
+                    break # Dừng giám sát cho tài khoản này
 
-                # Rejoin: Kill, Reset, Launch (Tất cả đều là tác vụ blocking, chạy trong pool)
-                kill_roblox_process(package_name)
-                reset_executor_file(username) 
-                time.sleep(5)
-                # Chạy Launch trong luồng pool
-                executor_pool.submit(launch_roblox, package_name, server_link, num_packages, package_statuses).result()
+                with rejoin_lock:
+                    kill_roblox_process(package_name)
+                    reset_executor_file(username) # Xóa tệp trạng thái cũ
+                    time.sleep(5)
+                    launch_roblox(package_name, server_link, num_packages, package_statuses)
                 
                 time.sleep(60) # Đợi game và executor tải lại
 
-                # Kiểm tra lại trạng thái sau khi rejoin
-                if executor_pool.submit(check_executor_status, username).result():
-                    retry_count = 0 
+                if check_executor_status(username):
+                    retry_count = 0 # Reset bộ đếm nếu thành công
                     with status_lock:
                         package_statuses[package_name]['Status'] = Fore.GREEN + 'Executor reloaded successfully.' + Style.RESET_ALL
+                    update_status_table(package_statuses)
                 else:
                     logger.error(f"Executor still failed for {username} after rejoin.")
             
@@ -855,10 +824,11 @@ def background_executor_monitor(package_name, username, package_statuses, server
             logger.error(f"Error in background monitor for {username}: {e}")
             with status_lock:
                 package_statuses[package_name]['Status'] = Fore.RED + f'Monitor Error: {e}' + Style.RESET_ALL
+            update_status_table(package_statuses)
 
 
 async def get_user_id_from_username(username):
-    """Lấy User ID từ Username (bất đồng bộ)."""
+    """Lấy User ID từ Username (bất đồng bộ). Thử cả roblox.com và roproxy.com."""
     urls = [
         'https://users.roblox.com/v1/usernames/users',
         'https://users.roproxy.com/v1/usernames/users' # Fallback
@@ -867,14 +837,15 @@ async def get_user_id_from_username(username):
     headers = {
         'Content-Type': 'application/json',
         'Accept': 'application/json',
+        # Thêm User-Agent của một trình duyệt di động phổ biến
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36'
     }
 
     for url in urls:
         try:
             logger.info(f"Attempting to get User ID from: {url}")
-            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as session:
-                async with session.post(url, json=payload, headers=headers) as response:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(url, json=payload, headers=headers, timeout=10) as response:
                     if response.status == 200:
                         data = await response.json()
                         if 'data' in data and len(data['data']) > 0:
@@ -884,10 +855,10 @@ async def get_user_id_from_username(username):
         except Exception as e:
             logger.error(f"Error getting user ID for {username} from {url}: {e}")
             
-    return None
+    return None # Trả về None nếu cả hai đều thất bại
 
 def get_username(user_id):
-    """Lấy Username từ User ID, sử dụng cache (Tác vụ chặn)."""
+    """Lấy Username từ User ID, sử dụng cache."""
     if user_id in username_cache:
         return username_cache[user_id]
 
@@ -900,7 +871,6 @@ def get_username(user_id):
     for url in urls:
         for attempt in range(retry_attempts):
             try:
-                # Sử dụng requests đồng bộ
                 response = requests.get(url, timeout=10)
                 response.raise_for_status()
                 data = response.json()
@@ -912,7 +882,7 @@ def get_username(user_id):
                 logger.warning(f'Attempt {attempt + 1} failed for {url}: {e}')
                 time.sleep(1)
                 
-    return 'Unknown'
+    return 'Unknown' # Trả về 'Unknown' nếu tất cả đều thất bại
 
 def save_cache():
     """Lưu cache username vào tệp."""
@@ -981,9 +951,8 @@ def save_server_links(server_links):
         for package, link in server_links:
             file.write(f'{package},{link}\n')
 
-
 async def setup_rejoin_accounts(packages):
-    """Thiết lập UserID cho các package."""
+    """Thiết lập UserID cho các package. Sẽ TỰ ĐỘNG XÓA các package đã gỡ cài đặt."""
     old_accounts_dict = dict(load_accounts())
     new_accounts_dict = {}
     
@@ -992,15 +961,17 @@ async def setup_rejoin_accounts(packages):
     
     for pkg in packages:
         if pkg in old_accounts_dict and old_accounts_dict[pkg] != 'SKIPPED':
+            # Gói này đã có và chưa bị bỏ qua, giữ lại
             new_accounts_dict[pkg] = old_accounts_dict[pkg]
             print(Fore.GREEN + f"Found existing account for {pkg}." + Style.RESET_ALL)
         else:
+            # Gói này mới, hoặc đã bị skip trước đó. Hỏi lại.
             username = input(Fore.CYAN + f"Enter Username for new package {pkg} (leave blank to skip): " + Style.RESET_ALL).strip()
             if username:
                 tasks.append(get_user_id_from_username(username))
                 packages_to_ask.append((pkg, username))
             else:
-                new_accounts_dict[pkg] = 'SKIPPED'
+                new_accounts_dict[pkg] = 'SKIPPED' # Đánh dấu là đã bỏ qua
 
     if tasks:
         print(Fore.YELLOW + "Fetching User IDs from Roblox API..." + Style.RESET_ALL)
@@ -1014,8 +985,9 @@ async def setup_rejoin_accounts(packages):
                 print(Fore.RED + f"Could not find User ID for {username}. Skipping package {pkg}." + Style.RESET_ALL)
                 new_accounts_dict[pkg] = 'SKIPPED'
             
+    # Lọc ra những tài khoản không bị bỏ qua
     final_accounts = [(pkg, uid) for pkg, uid in new_accounts_dict.items() if uid != 'SKIPPED']
-    save_accounts(final_accounts) 
+    save_accounts(final_accounts) # Ghi đè tệp account.txt CHỈ với các gói còn tồn tại
     return final_accounts
 
 def setup_server_links(accounts):
@@ -1032,8 +1004,7 @@ def setup_server_links(accounts):
                 print(Fore.GREEN + f"Using master link for {pkg}" + Style.RESET_ALL)
                 continue
                 
-            username = get_username(uid) # Blocking call
-            link = input(Fore.CYAN + f"Enter server link (or Game ID) for {pkg} (Username: {username}): " + Style.RESET_ALL).strip()
+            link = input(Fore.CYAN + f"Enter server link (or Game ID) for {pkg} (Username: {get_username(uid)}): " + Style.RESET_ALL).strip()
             if link:
                 server_links_dict[pkg] = link
                 if not master_link:
@@ -1049,26 +1020,20 @@ def setup_server_links(accounts):
 
 def start_auto_rejoin():
     """Quy trình chính để bắt đầu Auto Rejoin."""
-    global package_statuses # SỬA LỖI: Đảm bảo global được khai báo đầu tiên
+    global package_statuses
     
     print_header()
     print(Fore.CYAN + "--- Auto Rejoin ---" + Style.RESET_ALL)
-    stop_event.clear()
+    stop_event.clear() # Đảm bảo cờ stop được reset
 
-    # Chạy tác vụ chặn trong pool
-    packages = executor_pool.submit(get_roblox_packages).result()
+    packages = get_roblox_packages()
     if not packages:
         input(Fore.CYAN + "Press Enter to return to main menu..." + Style.RESET_ALL)
         return
 
-    # 1. Thiết lập tài khoản (UserID) - Bất đồng bộ
+    # 1. Thiết lập tài khoản (UserID)
     print(Fore.YELLOW + "Setting up accounts..." + Style.RESET_ALL)
-    try:
-        accounts = asyncio.run(setup_rejoin_accounts(packages))
-    except RuntimeError:
-        # Nếu đã có event loop chạy (hiếm), chạy thủ công
-        accounts = setup_rejoin_accounts(packages)
-        
+    accounts = asyncio.run(setup_rejoin_accounts(packages))
     if not accounts:
         print(Fore.RED + "No accounts configured. Cannot start auto-rejoin." + Style.RESET_ALL)
         input(Fore.CYAN + "Press Enter to return to main menu..." + Style.RESET_ALL)
@@ -1079,9 +1044,9 @@ def start_auto_rejoin():
     server_links = setup_server_links(accounts)
     server_links_dict = dict(server_links)
 
-    # 3. Phát hiện executor (Tác vụ chặn)
+    # 3. Phát hiện executor
     print(Fore.YELLOW + "Detecting executors and writing LUA scripts..." + Style.RESET_ALL)
-    detected_executors = executor_pool.submit(detect_and_write_lua_script).result()
+    detected_executors = detect_and_write_lua_script()
     if detected_executors:
         print(Fore.GREEN + f"Detected executors: {', '.join(detected_executors)}" + Style.RESET_ALL)
     else:
@@ -1092,28 +1057,26 @@ def start_auto_rejoin():
     package_statuses = {}
     threads = []
     
-    # Khởi động luồng cập nhật UI
-    status_thread = threading.Thread(target=status_update_thread_func, daemon=True)
-    status_thread.start()
-    threads.append(status_thread)
-
     for package_name, user_id in accounts:
         server_link = server_links_dict.get(package_name)
         if not server_link:
-            logger.warning(f"No server link found for {package_name}. Skipping.")
+            print(Fore.RED + f"No server link found for {package_name}. Skipping." + Style.RESET_ALL)
             continue
             
         username = get_username(user_id)
         
+        # Khởi tạo trạng thái
         with status_lock:
-            package_statuses[package_name] = {'Username': username, 'Status': Fore.YELLOW + 'Preparing...' + Style.RESET_ALL}
+            package_statuses[package_name] = {'Username': username, 'Status': Fore.YELLOW + 'Pending...' + Style.RESET_ALL}
         
-        # Thao tác tiền khởi động (Kill, Reset file)
+        # Dừng mọi tiến trình Roblox cũ
         kill_roblox_process(package_name)
+        
+        # Xóa tệp trạng thái cũ
         reset_executor_file(username)
         
-        # Khởi chạy Roblox (Chạy trong pool)
-        executor_pool.submit(launch_roblox, package_name, server_link, num_packages, package_statuses)
+        # Khởi chạy
+        launch_roblox(package_name, server_link, num_packages, package_statuses)
         
         # Nếu phát hiện executor, khởi động luồng giám sát
         if detected_executors:
@@ -1130,26 +1093,22 @@ def start_auto_rejoin():
     
     try:
         while True:
-            # Chỉ cần kiểm tra input, UI được cập nhật bởi luồng riêng
-            user_input = input().strip().lower()
-            if user_input == 'q':
+            if input().strip().lower() == 'q':
+                print(Fore.YELLOW + "Stopping auto-rejoin... (Killing processes)" + Style.RESET_ALL)
+                stop_event.set()
+                for package_name, _ in accounts:
+                    kill_roblox_process(package_name)
                 break
-            time.sleep(0.1)
+            time.sleep(1)
     except KeyboardInterrupt:
-        pass
+        print(Fore.YELLOW + "Stopping auto-rejoin... (Killing processes)" + Style.RESET_ALL)
+        stop_event.set()
+        for package_name, _ in accounts:
+            kill_roblox_process(package_name)
     
-    print(Fore.YELLOW + "Stopping auto-rejoin... (Killing processes)" + Style.RESET_ALL)
-    stop_event.set()
-    
-    # Giết tiến trình sau khi dừng
-    for package_name, _ in accounts:
-        kill_roblox_process(package_name)
-    
-    # Chờ các luồng monitor kết thúc (sử dụng timeout nhỏ)
+    # Chờ các luồng monitor kết thúc
     for t in threads:
         t.join(timeout=2)
-        
-    package_statuses = {} # Xóa trạng thái
 
 # --- Hàm Main (Chính) ---
 
@@ -1157,8 +1116,10 @@ def main():
     """Hiển thị menu chính và điều hướng người dùng."""
     set_console_title('VCP Manager - VCP Rejoin')
     
+    # Tải cache username khi khởi động
     load_cache()
     
+    # Tải cấu hình webhook và khởi động luồng nếu có
     load_webhook_config()
     if webhook_url:
         print(Fore.GREEN + "Webhook config loaded. Starting webhook thread..." + Style.RESET_ALL)
@@ -1184,17 +1145,14 @@ def main():
         elif choice == '3':
             getcookie_process()
         elif choice == '4':
-            # Chạy tác vụ chặn nặng trong pool
-            executor_pool.submit(inject_cookies_and_appstorage).result() 
+            inject_cookies_and_appstorage()
         elif choice == '5':
-            # Chạy tác vụ chặn nặng trong pool
-            executor_pool.submit(delete_roblox_cache).result() 
+            delete_roblox_cache()
         elif choice == '6':
-            print(Fore.YELLOW + 'Exiting... Thank thank for using VCP Manager!' + Style.RESET_ALL)
-            stop_event.set()
-            stop_webhook()
-            save_cache()
-            executor_pool.shutdown(wait=False) # Đóng pool
+            print(Fore.YELLOW + 'Exiting... Thank you for using VCP Manager!' + Style.RESET_ALL)
+            stop_event.set() # Dừng mọi luồng auto-rejoin
+            stop_webhook() # Dừng luồng webhook
+            save_cache() # Lưu cache trước khi thoát
             sys.exit(0)
         else:
             print(Fore.RED + 'Invalid option. Please try again.' + Style.RESET_ALL)
@@ -1209,11 +1167,9 @@ if __name__ == '__main__':
         save_cache()
         stop_event.set()
         stop_webhook()
-        executor_pool.shutdown(wait=False)
         print(Fore.GREEN + "Cache saved. Goodbye!")
         sys.exit(0)
     except Exception as e:
         logger.error(f"An unexpected error occurred: {e}")
         save_cache()
-        executor_pool.shutdown(wait=False)
         sys.exit(1)

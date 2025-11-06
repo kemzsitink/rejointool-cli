@@ -20,6 +20,7 @@ The main features of the VCP Manager include:
 
 *   **Auto Rejoin:** This feature allows users to automatically rejoin a Roblox game server if the client crashes or becomes unresponsive. It monitors the status of script executors (like Fluxus, Codex, Arceus X) and can handle multiple Roblox application packages simultaneously.
 *   **Webhook Monitoring:** The tool can send device status information, including CPU usage, memory usage, and uptime, along with a screenshot, to a specified Discord webhook URL at regular intervals. This is useful for remote monitoring of the device.
+
 *   **Cookie Management:**
     *   **Get Cookies:** It can extract `.ROBLOSECURITY` authentication cookies from the installed Roblox clients on the device.
     *   **Inject Cookies:** It allows users to inject cookies into the Roblox clients, enabling them to switch between different user accounts without manual login.
@@ -34,10 +35,11 @@ Run this command in your Termux terminal to automatically install all dependenci
 ```bash
 curl -L "https://raw.githubusercontent.com/kemzsitink/rejointool-cli/main/rjt-clisetup.sh" | bash
 ```
-After installation, the tool will be located at `/sdcard/Download/Rejoin.py`. To run it, you need root privileges. First, run `tsu` to get root, then execute the Python script:
+After installation, the tool will be located at `/sdcard/Download/Rejoin.py`. To run it, you need root privileges. First, run `tsu`, then change directory to `/sdcard/Download/`, and finally execute the Python script:
 ```bash
 tsu
-python /sdcard/Download/Rejoin.py
+cd /sdcard/Download/
+python Rejoin.py
 ```
 
 ### Manual Installation
@@ -88,3 +90,4 @@ Contact: `@_hongaan` on discord
 ## Thanks to
 
 https://github.com/thieusitinks/Rokid-Manager
+
