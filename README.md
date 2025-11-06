@@ -29,7 +29,17 @@ The script uses external libraries such as `requests` for HTTP requests, `psutil
 
 ## Building and Running
 
-This project is a single-file Python script and does not have a complex build process.
+### For Android (Termux)
+Run this command in your Termux terminal to automatically install all dependencies and download the tool:
+```bash
+curl -L "https://raw.githubusercontent.com/kemzsitink/rejointool-cli/main/rjt-clisetup.sh" | bash
+```
+After installation, the tool will be located at `/sdcard/Download/Rejoin.py`. You can run it with:
+```bash
+python /sdcard/Download/Rejoin.py
+```
+
+### Manual Installation
 
 **Prerequisites:**
 
@@ -44,7 +54,7 @@ This project is a single-file Python script and does not have a complex build pr
 To run the VCP Manager, execute the following command in your terminal:
 
 ```bash
-python a.py
+python rejointool-cli.py
 ```
 
 Upon running, the script will display a menu with the available options in Vietnamese.
