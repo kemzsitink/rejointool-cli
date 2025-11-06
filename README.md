@@ -34,8 +34,9 @@ Run this command in your Termux terminal to automatically install all dependenci
 ```bash
 curl -L "https://raw.githubusercontent.com/kemzsitink/rejointool-cli/main/rjt-clisetup.sh" | bash
 ```
-After installation, the tool will be located at `/sdcard/Download/Rejoin.py`. You can run it with:
+After installation, the tool will be located at `/sdcard/Download/Rejoin.py`. To run it, you need root privileges. First, run `tsu` to get root, then execute the Python script:
 ```bash
+tsu
 python /sdcard/Download/Rejoin.py
 ```
 
